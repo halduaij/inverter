@@ -36,6 +36,24 @@ class Setpoints:
     q_star: torch.Tensor  # Reactive power setpoints [Nc]
     theta_star: torch.Tensor  # Relative voltage angles (for tracking only in αβ) [Nc]
 
+def setpoints_to_pu(s: Setpoints, Vb: float, Sb: float) -> Setpoints:
+    """Convert a Setpoints dataclass to per unit."""
+    return Setpoints(
+        v_star=s.v_star / Vb,
+        p_star=s.p_star / Sb,
+        q_star=s.q_star / Sb,
+        theta_star=s.theta_star,
+    )
+
+def setpoints_from_pu(s: Setpoints, Vb: float, Sb: float) -> Setpoints:
+    """Convert a per-unit Setpoints back to SI units."""
+    return Setpoints(
+        v_star=s.v_star * Vb,
+        p_star=s.p_star * Sb,
+        q_star=s.q_star * Sb,
+        theta_star=s.theta_star,
+    )
+
 
 ##############################################################################
 # PowerSystemNetwork in PyTorch
@@ -52,6 +70,11 @@ class PowerSystemNetwork:
         # Base values (Section VII)
         self.Sb = 1000.0                # Base power: 1 kW
         self.Vb = 120.0                 # Base voltage: 120 V
+        self.Ib = self.Sb / self.Vb     # Base current
+        self.Zb = self.Vb / self.Ib     # Base impedance
+        self.Yb = 1.0 / self.Zb         # Base admittance
+        self.Lb = self.Zb / (2.0 * math.pi * 60.0)  # Base inductance
+        self.Cb = 1.0 / (self.Zb * 2.0 * math.pi * 60.0)  # Base capacitance
         self.omega0 = 2.0 * math.pi * 60.0  # Nominal frequency: 60 Hz
 
         # Network size (Figure 6)
@@ -63,9 +86,21 @@ class PowerSystemNetwork:
         self.rt = 0.05            # Line resistance (50 mΩ)
         self.lt = 0.2e-3         # Line inductance (0.2 mH)
 
+        # Keep physical copies for toggling units
+        self.rt_base = self.rt
+        self.lt_base = self.lt
+
+        # Per-unit versions
+        self.rt_pu = self.rt / self.Zb
+        self.lt_pu = self.lt / self.Lb
+
         # Load resistance at common coupling point
         self.rL =  115.0*1
+        self.rL_base = self.rL
+        self.rL_pu = self.rL / self.Zb
         self.kappa = math.atan(self.omega0 * self.lt / self.rt)
+
+        self.use_per_unit = False
 
         # R(κ) base
         R_kappa_base = torch.tensor([
@@ -87,6 +122,20 @@ class PowerSystemNetwork:
         self.In = torch.eye(self.n, dtype=self.dtype, device=self.device)
 
         # Initialize network
+        self.setup_network()
+
+    def switch_units(self, use_pu: bool):
+        """Toggle between physical and per-unit parameters."""
+        self.use_per_unit = use_pu
+        if use_pu:
+            self.rt = self.rt_pu
+            self.lt = self.lt_pu
+            self.rL = self.rL_pu
+        else:
+            self.rt = self.rt_base
+            self.lt = self.lt_base
+            self.rL = self.rL_base
+        self.kappa = math.atan(self.omega0 * self.lt / self.rt)
         self.setup_network()
 
     def setup_network(self):
@@ -238,9 +287,23 @@ class ConverterControl:
         self.lf = 1e-3
         self.cf = 24e-6
 
+        self.rf_base = self.rf
+        self.lf_base = self.lf
+        self.cf_base = self.cf
+
         # Per-converter filter conductances
         gf_np = [1/0.124, 1/0.124, 1/0.124]
         self.gf = torch.tensor(gf_np, dtype=self.dtype, device=self.device)
+        self.gf_base = self.gf.clone()
+
+        Zb = self.network.Zb
+        Lb = self.network.Lb
+        Cb = self.network.Cb
+        self.rf_pu = self.rf / Zb
+        self.lf_pu = self.lf / Lb
+        self.cf_pu = self.cf / Cb
+        self.gf_pu = self.gf * Zb
+        self.use_per_unit = False
 
         # Control gains
         self.eta = params['eta']
@@ -271,26 +334,52 @@ class ConverterControl:
 
         # Prepare filter and control matrices
         self.setup_converter_matrices()
+
+    def switch_units(self, use_pu: bool):
+        """Toggle between physical and per-unit parameters."""
+        self.use_per_unit = use_pu
+        if use_pu:
+            self.rf = self.rf_pu
+            self.lf = self.lf_pu
+            self.cf = self.cf_pu
+            self.gf = self.gf_pu
+        else:
+            self.rf = self.rf_base
+            self.lf = self.lf_base
+            self.cf = self.cf_base
+            self.gf = self.gf_base
+        self.setup_converter_matrices()
     def rebuild_control_matrices(self):
         """Reassemble the control matrices using current learnable parameters."""
         Nc = self.network.Nc
         In = self.network.In
 
+        if getattr(self.network, 'use_per_unit', False):
+            Kp_v = self.Kp_v * self.network.Zb
+            Ki_v = self.Ki_v * self.network.Zb
+            Kp_f = self.Kp_f / self.network.Zb
+            Ki_f = self.Ki_f / self.network.Zb
+        else:
+            Kp_v = self.Kp_v
+            Ki_v = self.Ki_v
+            Kp_f = self.Kp_f
+            Ki_f = self.Ki_f
+
         self.Kp_v_mat = torch.kron(
             torch.eye(Nc, dtype=self.dtype, device=self.device),
-            self.Kp_v * In
+            Kp_v * In
         )
         self.Ki_v_mat = torch.kron(
             torch.eye(Nc, dtype=self.dtype, device=self.device),
-            self.Ki_v * In
+            Ki_v * In
         )
         self.Kp_f_mat = torch.kron(
             torch.eye(Nc, dtype=self.dtype, device=self.device),
-            self.Kp_f * In
+            Kp_f * In
         )
         self.Ki_f_mat = torch.kron(
             torch.eye(Nc, dtype=self.dtype, device=self.device),
-            self.Ki_f * In
+            Ki_f * In
         )
     def setup_converter_matrices(self):
         Nc = self.network.Nc
@@ -310,30 +399,7 @@ class ConverterControl:
         # Filter impedance/admittance
         self.Zf = self.Rf + omega0 * (self.Jnc @ self.Lf)
         self.Yf = -omega0 * (self.Jnc @ self.Cf)
-
-        # PI control gains
-        Kp_v_mat = self.Kp_v
-        Ki_v_mat = self.Ki_v
-        Kp_f_mat = self.Kp_f
-        Ki_f_mat = self.Ki_f
-
-        # For dimension [2*Nc, 2*Nc], scale identity blocks
-        self.Kp_v_mat = torch.kron(
-            torch.eye(Nc, dtype=self.dtype, device=self.device),
-            Kp_v_mat * In
-        )
-        self.Ki_v_mat = torch.kron(
-            torch.eye(Nc, dtype=self.dtype, device=self.device),
-            Ki_v_mat * In
-        )
-        self.Kp_f_mat = torch.kron(
-            torch.eye(Nc, dtype=self.dtype, device=self.device),
-            Kp_f_mat * In
-        )
-        self.Ki_f_mat = torch.kron(
-            torch.eye(Nc, dtype=self.dtype, device=self.device),
-            Ki_f_mat * In
-        )
+        self.rebuild_control_matrices()
 
     def update_converter_state(self, idx, active, voltage_control, power_control):
         self.converter_states[idx].update({
@@ -676,6 +742,8 @@ class MultiConverterSimulation(torch.nn.Module):
         #    “True”  → integrate d i_line /dt              (17)
         #    “False” → i_line obtained algebraically via   (18)
         self.integrate_line_dynamics: bool = False
+        # operate solver in per unit mode
+        self.use_per_unit: bool = False
 
         # ------------------------------------------------------------------
         # 1.  learnable control parameters  (same initial values)
@@ -721,6 +789,81 @@ class MultiConverterSimulation(torch.nn.Module):
 
         # small cache for constraints
         self._constraint_cache = {}
+
+    # --------------------------------------------------------------- PU UTILITIES
+    def state_to_pu(self, state: torch.Tensor) -> torch.Tensor:
+        """Convert a state vector from SI units to per unit."""
+        Vb = self.network.Vb
+        Ib = self.network.Ib
+        Nc = self.network.Nc
+        n_conv = 2 * Nc
+        if self.integrate_line_dynamics:
+            n_line = 2 * self.network.Nt
+            vhat = state[0:n_conv] / Vb
+            i_line = state[n_conv:n_conv+n_line] / Ib
+            v = state[n_conv+n_line:2*n_conv+n_line] / Vb
+            zeta_v = state[2*n_conv+n_line:3*n_conv+n_line] / Vb
+            i_f = state[3*n_conv+n_line:4*n_conv+n_line] / Ib
+            zeta_f = state[4*n_conv+n_line:5*n_conv+n_line] / Ib
+            return torch.cat([vhat, i_line, v, zeta_v, i_f, zeta_f])
+        else:
+            vhat = state[0:n_conv] / Vb
+            v = state[n_conv:2*n_conv] / Vb
+            zeta_v = state[2*n_conv:3*n_conv] / Vb
+            i_f = state[3*n_conv:4*n_conv] / Ib
+            zeta_f = state[4*n_conv:5*n_conv] / Ib
+            return torch.cat([vhat, v, zeta_v, i_f, zeta_f])
+
+    def state_from_pu(self, state: torch.Tensor) -> torch.Tensor:
+        """Convert a state vector from per unit to SI units."""
+        if state.dim() == 2:
+            return torch.stack([self.state_from_pu(s) for s in state], dim=0)
+        Vb = self.network.Vb
+        Ib = self.network.Ib
+        Nc = self.network.Nc
+        n_conv = 2 * Nc
+        if self.integrate_line_dynamics:
+            n_line = 2 * self.network.Nt
+            vhat = state[0:n_conv] * Vb
+            i_line = state[n_conv:n_conv+n_line] * Ib
+            v = state[n_conv+n_line:2*n_conv+n_line] * Vb
+            zeta_v = state[2*n_conv+n_line:3*n_conv+n_line] * Vb
+            i_f = state[3*n_conv+n_line:4*n_conv+n_line] * Ib
+            zeta_f = state[4*n_conv+n_line:5*n_conv+n_line] * Ib
+            return torch.cat([vhat, i_line, v, zeta_v, i_f, zeta_f])
+        else:
+            vhat = state[0:n_conv] * Vb
+            v = state[n_conv:2*n_conv] * Vb
+            zeta_v = state[2*n_conv:3*n_conv] * Vb
+            i_f = state[3*n_conv:4*n_conv] * Ib
+            zeta_f = state[4*n_conv:5*n_conv] * Ib
+            return torch.cat([vhat, v, zeta_v, i_f, zeta_f])
+
+    # Wrapper around forward for per unit operation
+    def _forward_base(self, t: torch.Tensor, state: torch.Tensor):
+        """Original forward implementation preserved for internal use."""
+        # ------ disturbance injection (unchanged) --------------------------
+        if (self.scenario == "disturbance"
+                and not self.disturbance_applied
+                and t >= self.disturbance_time):
+            Nc = self.network.Nc
+            n_conv = 2*Nc
+            i_f_off = 3*n_conv if not self.integrate_line_dynamics else 3*n_conv + 2*self.network.Nt
+            state       = state.clone()
+            state[i_f_off:i_f_off+2*Nc] += self.disturbance
+            self.disturbance_applied = True
+
+        if self.integrate_line_dynamics:
+            return self.system_equations_differential(t, state)
+        else:
+            return self.system_equations_algebraic(t, state)
+
+    def _forward_pu(self, t: torch.Tensor, state_pu: torch.Tensor):
+        """Forward function when operating in per unit."""
+        state_si = self.state_from_pu(state_pu)
+        dx_si = self._forward_base(t, state_si)
+        dx_pu = self.state_to_pu(dx_si)
+        return dx_pu
 
 
     def check_equilibrium_residual(self, equilibrium_guess: Union[torch.Tensor, np.ndarray], t_steady_val: float = 10.0) -> float:
@@ -892,27 +1035,11 @@ class MultiConverterSimulation(torch.nn.Module):
 
     # =============================================================  FORWARD
     def forward(self, t: torch.Tensor, state: torch.Tensor):
-        """
-        Unified entry point used by `odeint`.
-        Delegates to the proper RHS depending on `self.integrate_line_dynamics`.
-        Disturbance injection kept identical to your previous logic.
-        """
-        # ------ disturbance injection (unchanged) --------------------------
-        if (self.scenario == "disturbance"
-                and not self.disturbance_applied
-                and t >= self.disturbance_time):
-            Nc = self.network.Nc
-            n_conv = 2*Nc
-            i_f_off = 3*n_conv if not self.integrate_line_dynamics else 3*n_conv + 2*self.network.Nt
-            state       = state.clone()
-            state[i_f_off:i_f_off+2*Nc] += self.disturbance
-            self.disturbance_applied = True
-
-        # ---------------- choose the correct model ------------------------
-        if self.integrate_line_dynamics:
-            return self.system_equations_differential(t, state)
+        """Entry point used by `odeint`. Handles per unit conversion."""
+        if self.use_per_unit:
+            return self._forward_pu(t, state)
         else:
-            return self.system_equations_algebraic(t, state)
+            return self._forward_base(t, state)
     def system_equations_algebraic(self, t, state):
         """
         RHS using algebraic elimination of i_line (same as your old
@@ -921,6 +1048,18 @@ class MultiConverterSimulation(torch.nn.Module):
         """
         with torch.no_grad():
             self.state_handler.update_states(float(t))
+            if self.use_per_unit:
+                self.converter.setpoints = setpoints_to_pu(
+                    self.converter.setpoints,
+                    self.network.Vb,
+                    self.network.Sb,
+                )
+            if self.use_per_unit:
+                self.converter.setpoints = setpoints_to_pu(
+                    self.converter.setpoints,
+                    self.network.Vb,
+                    self.network.Sb,
+                )
 
         # update gain matrices
         self.converter.eta   = self.eta
@@ -973,6 +1112,12 @@ class MultiConverterSimulation(torch.nn.Module):
         """
         with torch.no_grad():
             self.state_handler.update_states(float(t))
+            if self.use_per_unit:
+                self.converter.setpoints = setpoints_to_pu(
+                    self.converter.setpoints,
+                    self.network.Vb,
+                    self.network.Sb,
+                )
 
         self.converter.eta   = self.eta
         self.converter.eta_a = self.eta_a
@@ -1024,6 +1169,10 @@ class MultiConverterSimulation(torch.nn.Module):
 
         self.setup_scenario(scenario)
 
+        # Switch models to desired units
+        self.network.switch_units(self.use_per_unit)
+        self.converter.switch_units(self.use_per_unit)
+
         # Prepare time steps
         steps = int(self.T_sim / self.dt) + 1
         t_span = torch.linspace(
@@ -1032,6 +1181,8 @@ class MultiConverterSimulation(torch.nn.Module):
 
         # Initialize state based on scenario
         x0 = self.initialize_state(scenario)
+        if self.use_per_unit:
+            x0 = self.state_to_pu(x0)
 
         # Run simulation
         sol = odeint(
@@ -1044,7 +1195,29 @@ class MultiConverterSimulation(torch.nn.Module):
             method='radau'
             )
 
+        if self.use_per_unit:
+            sol = self.state_from_pu(sol)
+
+        # Restore physical units for subsequent runs
+        self.network.switch_units(False)
+        self.converter.switch_units(False)
+
         return t_span, sol
+
+    def run_per_unit_validation(self, scenario="black_start") -> float:
+        """Run base and per-unit simulations and return max difference."""
+        # Run base simulation
+        self.use_per_unit = False
+        t_base, sol_base = self.run_simulation_for_scenario(scenario)
+
+        # Run per unit simulation
+        self.use_per_unit = True
+        t_pu, sol_pu = self.run_simulation_for_scenario(scenario)
+        self.use_per_unit = False
+
+        diff = torch.max(torch.abs(sol_base - sol_pu)).item()
+        print(f"Per-unit validation difference: {diff:.6e}")
+        return diff
 
 
     def update_lagrange_multipliers(self, step_size=0.1):
@@ -1927,7 +2100,7 @@ if __name__ == '__main__':
     random.seed(42)
 
     # Choose operation mode
-    mode = "optimize_multi"  # Options: "optimize_single", "optimize_multi", "test"
+    mode = "optimize_multi"  # Options: "optimize_single", "optimize_multi", "test", "per_unit_check"
 
     if mode == "optimize_single":
         # Optimize for a single scenario (original approach)
@@ -1965,4 +2138,9 @@ if __name__ == '__main__':
             print(f"\nRunning {scenario} scenario...")
             t_vec, sol = sim.run_simulation_for_scenario(scenario)
             sim.process_and_plot_scenario_results(t_vec, sol)
+
+    elif mode == "per_unit_check":
+        # Validate per unit implementation
+        diff = sim.run_per_unit_validation("black_start")
+        print(f"Maximum deviation between base and per unit: {diff:.6e}")
 
